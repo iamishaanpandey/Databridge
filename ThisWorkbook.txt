@@ -1,0 +1,56 @@
+Private Sub Workbook_Open()
+    ' ==============================================================================
+    ' 1. VERSION CONTROL CHECK (NEW ADDITION)
+    ' ==============================================================================
+    Const EXPECTED_VERSION_NAME As String = "ST DataBridge_PCN_V2.6.xlsm"
+    Const DOWNLOAD_URL As String = "https://stmicroelectronics.sharepoint.com/teams/XcelAgilite"
+    
+    Dim currentName As String
+    Dim msg As String
+    Dim userResponse As VbMsgBoxResult
+    
+    currentName = ThisWorkbook.Name
+    
+    ' Check if current filename matches expected version (Case Insensitive)
+    If StrComp(currentName, EXPECTED_VERSION_NAME, vbTextCompare) <> 0 Then
+        
+        ' Build Warning Message
+        msg = "CRITICAL VERSION WARNING" & vbNewLine & vbNewLine & _
+              "You are not using the updated version of Databridge." & vbNewLine & vbNewLine & _
+              "Current File: " & currentName & vbNewLine & _
+              "Required File: " & EXPECTED_VERSION_NAME & vbNewLine & vbNewLine & _
+              "Kindly download the latest version from:" & vbNewLine & _
+              DOWNLOAD_URL & vbNewLine & vbNewLine & _
+              "Do you want to open the download page now?"
+        
+        ' Show Popup
+        userResponse = MsgBox(msg, vbCritical + vbYesNo, "Version Mismatch Detected")
+        
+        ' Open Link if User clicks Yes
+        If userResponse = vbYes Then
+            On Error Resume Next
+            ThisWorkbook.FollowHyperlink Address:=DOWNLOAD_URL
+            On Error GoTo 0
+        End If
+    End If
+
+    ' ==============================================================================
+    ' 2. EXISTING DASHBOARD SETUP
+    ' ==============================================================================
+    Dim wsDash As Worksheet
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+
+    ' 1. EXISTING SETTING: Restrict scrolling
+    wsDash.ScrollArea = "A1:AH30"
+
+    ' 2. NEW SECURITY: Force the lock
+    ' We call the macro directly by name to avoid Module naming errors
+    ' Added On Error Resume Next to prevent crashes if the Module is missing in older versions
+    On Error Resume Next
+    Call Lock_Column_Settings
+    On Error GoTo 0
+
+    ' 3. EXISTING SETTING: Focus
+    wsDash.Activate
+End Sub
+
