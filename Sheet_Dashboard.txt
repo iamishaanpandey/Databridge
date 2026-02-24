@@ -1,0 +1,174 @@
+Option Explicit
+
+' ==========================================
+' SHEET EVENT: MASTER CONTROLLER (MULTI-SELECT + TICKED DROPDOWN)
+' Updated: Supports 12 Keys, Safety Checks, and Tick Clearing
+' ==========================================
+Private Sub Worksheet_Change(ByVal Target As Range)
+    Dim rngKeys As Range, rngCols As Range, rngVals As Range
+    Dim rngSheet As Range
+    Dim oldVal As String, newVal As String, cleanVal As String
+    Dim checkChar As String: checkChar = ChrW(&H2714) & " "
+    
+    ' New variable to safely hold the range name
+    Dim targetName As String
+    
+    If Target.CountLarge > 1 Then Exit Sub
+    
+    ' Define Ranges for 12 Keys, 12 Values, and 12 Columns
+    ' Using On Error Resume Next prevents crashing if a named range is missing
+    On Error Resume Next
+    Set rngKeys = Me.Range("Key1_Fetch, Key2_Fetch, Key3_Fetch, Key4_Fetch, Key5_Fetch, Key6_Fetch, Key7_Fetch, Key8_Fetch, Key9_Fetch, Key10_Fetch, Key11_Fetch, Key12_Fetch")
+    Set rngVals = Me.Range("Val1_Fetch, Val2_Fetch, Val3_Fetch, Val4_Fetch, Val5_Fetch, Val6_Fetch, Val7_Fetch, Val8_Fetch, Val9_Fetch, Val10_Fetch, Val11_Fetch, Val12_Fetch")
+    Set rngCols = Me.Range("Col1_Update, Col2_Update, Col3_Update, Col4_Update, Col5_Update, Col6_Update, Col7_Update, Col8_Update, Col9_Update, Col10_Update, Col11_Update, Col12_Update")
+    Set rngSheet = Me.Range("Sheet_Source")
+    On Error GoTo 0
+    
+    ' *** SAFETY CHECK: Exit if ranges are not fully defined yet ***
+    If rngKeys Is Nothing Or rngVals Is Nothing Then Exit Sub
+
+    ' ------------------------------------------------------
+    ' 1. HANDLE MULTI-SELECT WITH TICKED DROPDOWN LOGIC
+    ' ------------------------------------------------------
+    If Not Intersect(Target, rngVals) Is Nothing Then
+        
+        ' *** SAFE NAME CAPTURE ***
+        ' We capture the name safely. If it fails, targetName stays empty.
+        On Error Resume Next
+        targetName = Target.Name.Name
+        On Error GoTo 0
+        
+        newVal = CStr(Target.Value)
+        
+        ' *** NEW: Handle Deletion (Clear Ticks) ***
+        If newVal = "" Then
+            ' If user clears the cell, remove all ticks for this dropdown in Cache
+            If targetName <> "" Then Call Module1.Clear_Dropdown_Ticks(targetName)
+            Exit Sub
+        End If
+        
+        Application.EnableEvents = False
+        On Error Resume Next
+        
+        ' Undo to get the previous value (for multi-select appending)
+        Application.Undo
+        oldVal = CStr(Target.Value)
+        Target.Value = newVal
+        
+        ' Identify the actual value without the checkmark
+        cleanVal = Replace(newVal, checkChar, "")
+        
+        If oldVal <> "" Then
+            ' Check if value is already selected (Toggle Logic)
+            If InStr(1, oldVal, cleanVal) > 0 Then
+                ' TOGGLE OFF: Remove value if already present
+                If InStr(1, oldVal, ", " & checkChar & cleanVal) > 0 Then
+                    Target.Value = Replace(oldVal, ", " & checkChar & cleanVal, "")
+                ElseIf InStr(1, oldVal, checkChar & cleanVal & ", ") > 0 Then
+                    Target.Value = Replace(oldVal, checkChar & cleanVal & ", ", "")
+                ElseIf oldVal = (checkChar & cleanVal) Then
+                    Target.Value = ""
+                    ' If it becomes empty after toggle, clear ticks
+                    If targetName <> "" Then Call Module1.Clear_Dropdown_Ticks(targetName)
+                    GoTo Finalize
+                End If
+            Else
+                ' TOGGLE ON: Append new selection with checkmark
+                Target.Value = oldVal & ", " & checkChar & cleanVal
+            End If
+        Else
+            ' FIRST SELECTION: Add checkmark
+            Target.Value = checkChar & cleanVal
+        End If
+        
+Finalize:
+        ' REFRESH THE DROPDOWN LIST: Updates ticks inside the Cache
+        If Target.Value <> "" And targetName <> "" Then
+            Call Module1.Refresh_Ticked_List(targetName, CStr(Target.Value))
+        End If
+        
+        On Error GoTo 0
+        Application.EnableEvents = True
+        
+        ' PERSIST DROPDOWN: Force the list to stay open for the next selection
+        Target.Select
+        SendKeys "%{DOWN}"
+    End If
+
+    ' ------------------------------------------------------
+    ' 2. HANDLE SHEET SELECTION
+    ' ------------------------------------------------------
+    If Not Intersect(Target, rngSheet) Is Nothing Then
+        If CStr(Target.Value) <> "" Then Call Module1.Load_New_Sheet_Selection
+    End If
+
+    ' ------------------------------------------------------
+    ' 3. HANDLE KEYS (Single Select + Dropdown Refresh)
+    ' ------------------------------------------------------
+    If Not Intersect(Target, rngKeys) Is Nothing Then
+        Application.EnableEvents = False
+        On Error Resume Next
+        Dim keyName As String: keyName = Target.Name.Name
+        Dim valName As String: valName = Replace(keyName, "Key", "Val")
+        
+        ' Clear previous values because key has changed
+        Me.Range(valName).MergeArea.ClearContents
+        
+        ' Refresh dropdown source in Cache
+        Call Module1.Update_Value_Dropdown(keyName, valName)
+        Call Module1.Generate_Smart_List
+        On Error GoTo 0
+        Application.EnableEvents = True
+    End If
+
+    ' ------------------------------------------------------
+    ' 4. HANDLE COLUMN DUPLICATES
+    ' ------------------------------------------------------
+    If Not Intersect(Target, rngCols) Is Nothing Then
+        Call Check_Column_Duplicates(Target)
+    End If
+End Sub
+
+' ------------------------------------------
+' HELPER: PREVENT DUPLICATE COLUMN SELECTION
+' ------------------------------------------
+Private Sub Check_Column_Duplicates(Target As Range)
+    Dim i As Integer
+    Dim arrCols(1 To 12) As String
+    Dim checkValue As Variant
+    
+    On Error Resume Next
+    checkValue = Target.Cells(1, 1).Value
+    On Error GoTo 0
+    
+    If IsEmpty(checkValue) Or CStr(checkValue) = "" Then Exit Sub
+    
+    Application.EnableEvents = False
+    
+    ' Collect all current column selections
+    For i = 1 To 12
+        On Error Resume Next
+        arrCols(i) = Trim(Me.Range("Col" & i & "_Update").Value)
+        On Error GoTo 0
+    Next i
+    
+    ' Compare current target against all others
+    For i = 1 To 12
+        ' Skip the current cell being changed
+        If Not Intersect(Target, Me.Range("Col" & i & "_Update")) Is Nothing Then GoTo Next_i
+        
+        If arrCols(i) <> "" Then
+            If StrComp(Trim(CStr(checkValue)), arrCols(i), vbTextCompare) = 0 Then
+                MsgBox "Duplicate Column Error:" & vbNewLine & _
+                        "You have already selected '" & checkValue & "' in another slot.", vbCritical
+                Target.MergeArea.ClearContents
+                GoTo ExitSub
+            End If
+        End If
+Next_i:
+    Next i
+
+ExitSub:
+    Application.EnableEvents = True
+End Sub
+
