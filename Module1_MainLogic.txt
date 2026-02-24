@@ -1,0 +1,1421 @@
+Option Explicit
+
+' ==============================================================================
+' MODULE: FINAL INTEGRATED LOGIC (REFACTORED V7 - FSO IMPLEMENTED)
+' Features:
+' 1. Memory Hammer: Dates are forced to Text strings (Values Only).
+' 2. Formatting Safe: Source colors/fonts are copied via PasteFormats.
+' 3. Ghost Update Fix: "Lazy" comparison ignores artifacts (Spaces/Empty Dates).
+' 4. Strict 1:1 Mapping: Update Logic uses pre-calculated indices.
+' 5. Unicode Support: FileSystemObject used instead of legacy Dir().
+' ==============================================================================
+
+' *** CENTRAL ADMIN PASSWORD ***
+Public Const ADMIN_PASS As String = "Admin123"
+
+Private transactionLogs As Collection
+
+' ------------------------------------------
+' 1. FORCE RESET & NAVIGATION
+' ------------------------------------------
+Sub Force_Reset()
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.DisplayAlerts = False
+    
+    On Error Resume Next
+    ThisWorkbook.Sheets("Dashboard").Unprotect Password:=ADMIN_PASS
+    ThisWorkbook.Sheets("Data_View").Delete
+    ' Note: Dropdowns sheet is preserved
+    On Error GoTo 0
+    
+    Application.DisplayAlerts = True
+    MsgBox "Reset Complete. (Dropdowns sheet preserved)", vbInformation
+End Sub
+
+Sub Go_To_Dashboard()
+    Dim wsDash As Worksheet
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    On Error Resume Next
+    wsDash.Unprotect Password:=ADMIN_PASS
+    On Error GoTo 0
+    wsDash.Activate
+    wsDash.Range("A1").Select
+    wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+End Sub
+
+' ------------------------------------------
+' 2. VIEW SOURCE FILE (READ ONLY)
+' ------------------------------------------
+Sub Btn_View_Source_Click()
+    Dim wsDash As Worksheet
+    Dim filePath As String
+    Dim wbSrc As Workbook
+    Dim wasAlreadyOpen As Boolean
+    Dim fso As Object ' <--- FSO Declaration
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    On Error Resume Next
+    filePath = wsDash.Range("Path_Source").Value
+    On Error GoTo 0
+    
+    ' <--- REFACTORED: Use FSO instead of Dir() for Unicode support
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    If filePath = "" Or Not fso.FileExists(filePath) Then
+        MsgBox "Please select a valid file path first.", vbExclamation
+        Set fso = Nothing
+        Exit Sub
+    End If
+    Set fso = Nothing
+    ' <--- END REFACTOR
+    
+    Application.ScreenUpdating = False
+    
+    ' Force READ ONLY = True
+    Set wbSrc = Robust_Open_Workbook_With_Retry(filePath, False, wasAlreadyOpen)
+    
+    Application.ScreenUpdating = True
+    
+    If Not wbSrc Is Nothing Then
+        wbSrc.Windows(1).Visible = True
+        wbSrc.Activate
+        MsgBox "File opened in READ-ONLY mode for viewing protection.", vbInformation
+    End If
+End Sub
+
+' ------------------------------------------
+' 3. BROWSE BUTTON
+' ------------------------------------------
+Sub Btn_Browse_Source()
+    Dim filePath As Variant
+    Dim inputCell As Range, sheetCell As Range
+    Dim wsCache As Worksheet, wsDash As Worksheet
+    Dim wbSrc As Workbook, wsSrc As Worksheet
+    Dim hRow As Long
+    Dim wasAlreadyOpen As Boolean
+    Dim i As Integer
+    Dim validSheetCount As Long
+    Dim sheetNamesList As String
+    Dim cleanName As String
+    Dim cacheRangeAddr As String
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    
+    ' --- EXPLICIT UNPROTECT ---
+    On Error Resume Next
+    wsDash.Unprotect Password:=ADMIN_PASS
+    If Err.Number <> 0 Then wsDash.Unprotect Password:=""
+    On Error GoTo 0
+
+    Set inputCell = wsDash.Range("Path_Source")
+    Set sheetCell = wsDash.Range("Sheet_Source")
+    hRow = wsDash.Range("Header_Row").Value: If hRow < 1 Then hRow = 12
+    
+    If sheetCell Is Nothing Then
+        If Not inputCell Is Nothing Then
+            inputCell.Offset(1, 0).Name = "Sheet_Source"
+            Set sheetCell = wsDash.Range("Sheet_Source")
+            sheetCell.ClearContents
+            With sheetCell
+                .Borders.LineStyle = xlContinuous
+                .Interior.Color = RGB(255, 255, 204)
+            End With
+        End If
+    End If
+
+    filePath = Application.GetOpenFilename("Excel Files (*.xlsx; *.xlsm), *.xlsx; *.xlsm", , "Select Source Data")
+    
+    If filePath <> False Then
+        Application.ScreenUpdating = False
+        Application.EnableEvents = False
+        Application.DisplayAlerts = False
+        
+        inputCell.Value = filePath
+        wasAlreadyOpen = False
+        
+        ' Open Read-Only for fetching headers
+        Set wbSrc = Robust_Open_Workbook_With_Retry(CStr(filePath), False, wasAlreadyOpen)
+        
+        If wbSrc Is Nothing Then
+            MsgBox "File locked by another user. Try again later or Check File label is selected correctly", vbCritical
+            GoTo Cleanup
+        End If
+        
+        On Error Resume Next
+        Set wsCache = ThisWorkbook.Sheets("Cache")
+        If wsCache Is Nothing Then
+            Set wsCache = ThisWorkbook.Sheets.Add
+            wsCache.Name = "Cache"
+        End If
+        wsCache.Visible = xlSheetVeryHidden
+        On Error GoTo 0
+        
+        wsCache.Columns(16384).Clear
+        wsCache.Cells(1, 16384).Value = "Select All"
+        sheetNamesList = "Select All,"
+        validSheetCount = 0
+        
+        For i = 1 To wbSrc.Sheets.Count
+            Set wsSrc = wbSrc.Sheets(i)
+            If wsSrc.Visible = xlSheetVisible Then
+                If InStr(1, wsSrc.Name, "dropdown", vbTextCompare) = 0 Then
+                    If Application.CountA(wsSrc.Rows(hRow)) > 1 Then
+                        cleanName = wsSrc.Name
+                        validSheetCount = validSheetCount + 1
+                        wsCache.Cells(validSheetCount + 1, 16384).Value = cleanName
+                        sheetNamesList = sheetNamesList & cleanName & ","
+                    End If
+                End If
+            End If
+        Next i
+        
+        If Len(sheetNamesList) > 0 Then sheetNamesList = Left(sheetNamesList, Len(sheetNamesList) - 1)
+        
+        With sheetCell.MergeArea.Validation
+            .Delete
+            If Len(sheetNamesList) < 255 Then
+                .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:=sheetNamesList
+            Else
+                cacheRangeAddr = "'" & wsCache.Name & "'!" & wsCache.Range("XFD1").Resize(validSheetCount + 1, 1).Address
+                On Error Resume Next
+                ThisWorkbook.Names("DynamicSheetList").Delete
+                On Error GoTo 0
+                ThisWorkbook.Names.Add Name:="DynamicSheetList", RefersTo:="=" & cacheRangeAddr
+                .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="=DynamicSheetList"
+            End If
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowError = False
+        End With
+        
+        sheetCell.Value = "Select All"
+        
+        Call Load_New_Sheet_Selection
+        On Error Resume Next
+        If Not wbSrc Is Nothing Then
+            If wasAlreadyOpen = False Then wbSrc.Close SaveChanges:=False
+        End If
+        On Error GoTo 0
+        
+        
+        Application.DisplayAlerts = True
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+        
+        wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+        
+        MsgBox "Source Loaded." & vbNewLine & "Valid Sheets: " & validSheetCount, vbInformation
+    End If
+    Exit Sub
+
+Cleanup:
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+End Sub
+
+Sub Load_New_Sheet_Selection()
+    Dim wsDash As Worksheet, wsCache As Worksheet
+    Dim wbSrc As Workbook, wsSrc As Worksheet
+    Dim filePath As String, sheetName As String
+    Dim hRow As Long
+    Dim wasAlreadyOpen As Boolean
+    Dim i As Integer, c As Long
+    Dim lastRowCache As Long, srcLastRow As Long, srcLastCol As Long
+    Dim GlobalMaxCol As Long, TrackingCol As Long
+    Dim headerCopied As Boolean
+    Dim cellColor As Long
+    
+    Const CACHE_META_ROW As Long = 1
+    Const CACHE_HEAD_ROW As Long = 2
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    On Error Resume Next
+    wsDash.Unprotect Password:=ADMIN_PASS
+    filePath = wsDash.Range("Path_Source").Value
+    sheetName = wsDash.Range("Sheet_Source").Value
+    hRow = wsDash.Range("Header_Row").Value: If hRow < 1 Then hRow = 12
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    On Error GoTo 0
+    
+    If filePath = "" Or sheetName = "" Or wsCache Is Nothing Then GoTo Cleanup
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    
+    ' 1. OPEN FILE & HIDE IMMEDIATELY
+    Set wbSrc = Robust_Open_Workbook_With_Retry(filePath, False, wasAlreadyOpen)
+    
+    If wbSrc Is Nothing Then
+        MsgBox "Could not open file.", vbCritical
+        GoTo Cleanup
+    End If
+    
+    On Error Resume Next
+    wbSrc.Windows(1).Visible = False
+    On Error GoTo 0
+
+    wsCache.Range("A:XFC").Clear
+    
+    ' 2. Determine Global Max Column
+    GlobalMaxCol = 0
+    If sheetName = "Select All" Then
+        For i = 1 To wbSrc.Sheets.Count
+             Set wsSrc = wbSrc.Sheets(i)
+             If wsSrc.Visible = xlSheetVisible And InStr(1, wsSrc.Name, "dropdown", vbTextCompare) = 0 Then
+                 If Application.CountA(wsSrc.Rows(hRow)) > 1 Then
+                     srcLastCol = wsSrc.Cells(hRow, wsSrc.Columns.Count).End(xlToLeft).Column
+                     If srcLastCol > GlobalMaxCol Then GlobalMaxCol = srcLastCol
+                 End If
+             End If
+        Next i
+    Else
+        Set wsSrc = wbSrc.Sheets(sheetName)
+        srcLastCol = wsSrc.Cells(hRow, wsSrc.Columns.Count).End(xlToLeft).Column
+        GlobalMaxCol = srcLastCol
+    End If
+    
+    ' Only Tracking Sheet Name now, no Row ID column
+    TrackingCol = GlobalMaxCol + 1
+    
+    headerCopied = False
+    lastRowCache = CACHE_HEAD_ROW
+    
+    ' 3. Process Sheets (COPY DATA)
+    Dim sheetsToProcess As Collection
+    Set sheetsToProcess = New Collection
+    
+    If sheetName = "Select All" Then
+        For i = 1 To wbSrc.Sheets.Count
+            sheetsToProcess.Add wbSrc.Sheets(i)
+        Next i
+    Else
+        sheetsToProcess.Add wbSrc.Sheets(sheetName)
+    End If
+    
+    For Each wsSrc In sheetsToProcess
+        If wsSrc.Visible = xlSheetVisible And InStr(1, wsSrc.Name, "dropdown", vbTextCompare) = 0 Then
+            If Application.CountA(wsSrc.Rows(hRow)) > 1 Then
+                srcLastRow = wsSrc.Cells(wsSrc.Rows.Count, 1).End(xlUp).Row
+                srcLastCol = wsSrc.Cells(hRow, wsSrc.Columns.Count).End(xlToLeft).Column
+                
+                If srcLastRow >= hRow Then
+                     If headerCopied = False Then
+                        ' Copy Headers
+                        wsSrc.Range(wsSrc.Cells(hRow, 1), wsSrc.Cells(hRow, srcLastCol)).Copy Destination:=wsCache.Cells(CACHE_HEAD_ROW, 1)
+                        
+                        ' Write Meta Header (Sheet Name Only)
+                        wsCache.Cells(CACHE_HEAD_ROW, TrackingCol).Value = "Source_Sheet_Name"
+                        
+                        For c = 1 To srcLastCol
+                            cellColor = wsSrc.Cells(hRow, c).Interior.Color
+                            If cellColor <> 16777215 And cellColor <> xlNone Then
+                                wsCache.Cells(CACHE_META_ROW, c).Value = "EDITABLE"
+                            End If
+                        Next c
+                        headerCopied = True
+                    End If
+                    
+                    If srcLastRow > hRow Then
+                        lastRowCache = wsCache.Cells(wsCache.Rows.Count, 1).End(xlUp).Row
+                        
+                        ' Copy Data
+                        wsSrc.Range(wsSrc.Cells(hRow + 1, 1), wsSrc.Cells(srcLastRow, srcLastCol)).Copy Destination:=wsCache.Cells(lastRowCache + 1, 1)
+                        
+                        Dim newLastRow As Long
+                        newLastRow = wsCache.Cells(wsCache.Rows.Count, 1).End(xlUp).Row
+                        
+                        ' Fill Sheet Name
+                        wsCache.Range(wsCache.Cells(lastRowCache + 1, TrackingCol), wsCache.Cells(newLastRow, TrackingCol)).Value = wsSrc.Name
+                    End If
+                End If
+            End If
+        End If
+    Next wsSrc
+    
+    If wasAlreadyOpen = False Then
+        On Error Resume Next
+        If Not wbSrc Is Nothing Then
+            wbSrc.Close SaveChanges:=False
+        End If
+        On Error GoTo 0
+        DoEvents
+    End If
+
+    Call Update_Header_Dropdowns(CACHE_HEAD_ROW)
+    
+    ' Update Value Dropdowns
+    Dim keyIdx As Integer
+    Dim curKey As String, foundHeader As Range
+    Dim lastColCache As Long
+    lastColCache = wsCache.Cells(CACHE_HEAD_ROW, Columns.Count).End(xlToLeft).Column
+    
+    For keyIdx = 1 To 12
+        On Error Resume Next
+        curKey = wsDash.Range("Key" & keyIdx & "_Fetch").Value
+        On Error GoTo 0
+        If curKey <> "" Then
+            Set foundHeader = wsCache.Range(wsCache.Cells(CACHE_HEAD_ROW, 1), wsCache.Cells(CACHE_HEAD_ROW, lastColCache)).Find(What:=curKey, LookIn:=xlValues, LookAt:=xlWhole)
+            If Not foundHeader Is Nothing Then
+                Call Update_Value_Dropdown("Key" & keyIdx & "_Fetch", "Val" & keyIdx & "_Fetch")
+            End If
+        End If
+    Next keyIdx
+
+    Call Generate_Smart_List
+    Call Check_Mapping_Integrity
+    
+Cleanup:
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+End Sub
+
+' ------------------------------------------
+' 5. DROPDOWN & LIST LOGIC
+' ------------------------------------------
+Sub Update_Header_Dropdowns(hRow As Long)
+    Dim wsCache As Worksheet
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    Dim lastCol As Long
+    lastCol = wsCache.Cells(hRow, Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then Exit Sub
+    
+    On Error Resume Next
+    ThisWorkbook.Names.Add Name:="List_Headers", RefersTo:="=Cache!" & wsCache.Range(wsCache.Cells(hRow, 1), wsCache.Cells(hRow, lastCol)).Address
+    
+    Dim i As Integer
+    For i = 1 To 12
+        Apply_Validation ThisWorkbook.Sheets("Dashboard").Range("Key" & i & "_Fetch"), "=List_Headers"
+        Apply_Validation ThisWorkbook.Sheets("Dashboard").Range("Key" & i & "_Update"), "=List_Headers"
+    Next i
+    On Error GoTo 0
+End Sub
+
+Sub Generate_Smart_List()
+    Dim wsCache As Worksheet, wsDash As Worksheet
+    Dim lastCol As Long, i As Long
+    Dim outputRow As Long
+    Dim headerVal As String
+    Dim curVal As String
+    Dim cellUpdate As Range
+    Dim dictForbidden As Object
+    Const CACHE_HEAD_ROW As Long = 2
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    wsDash.Unprotect Password:=ADMIN_PASS
+    
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    If wsCache Is Nothing Then GoTo Relock
+    
+    Set dictForbidden = CreateObject("Scripting.Dictionary")
+    
+    ' 1. Load Forbidden Keys (Fetch Keys)
+    Dim kVal As String
+    For i = 1 To 12
+        On Error Resume Next
+        kVal = Trim(wsDash.Range("Key" & i & "_Fetch").Value)
+        If kVal <> "" Then dictForbidden.Add kVal, 1
+        On Error GoTo 0
+    Next i
+    
+    ' 2. Build List of Editable Headers
+    wsCache.Columns(500).Clear
+    lastCol = wsCache.Cells(CACHE_HEAD_ROW, Columns.Count).End(xlToLeft).Column
+    outputRow = 1
+    
+    For i = 1 To lastCol
+        headerVal = Trim(wsCache.Cells(CACHE_HEAD_ROW, i).Value)
+        If headerVal <> "" Then
+            ' Add if "EDITABLE" flag is present
+            If wsCache.Cells(1, i).Value = "EDITABLE" Then
+                If Not dictForbidden.Exists(headerVal) Then
+                    wsCache.Cells(outputRow, 500).Value = headerVal
+                    outputRow = outputRow + 1
+                End If
+            End If
+        End If
+    Next i
+    
+    If outputRow > 1 Then
+        ThisWorkbook.Names.Add Name:="List_Editable", RefersTo:="=Cache!" & wsCache.Range(wsCache.Cells(1, 500), wsCache.Cells(outputRow - 1, 500)).Address
+    End If
+    
+    For i = 1 To 12
+        On Error Resume Next
+        Set cellUpdate = wsDash.Range("Col" & i & "_Update")
+        If Not cellUpdate Is Nothing Then
+            Apply_Validation cellUpdate, "=List_Editable"
+            ' *MODIFIED*: Safety Check - Do NOT delete invalid values automatically.
+            ' Logic moved to Check_Mapping_Integrity to warn instead.
+            ' curVal = cellUpdate.Value
+            ' If curVal <> "" And dictForbidden.Exists(curVal) Then
+            '     cellUpdate.MergeArea.ClearContents
+            ' End If
+        End If
+        On Error GoTo 0
+    Next i
+
+Relock:
+    wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+End Sub
+Sub Update_Value_Dropdown(keyCellName As String, valCellName As String)
+    Dim wsCache As Worksheet
+    Dim colHeader As String, foundHeader As Range
+    Dim wsDash As Worksheet
+    Const CACHE_HEAD_ROW As Long = 2
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    Application.ScreenUpdating = False
+    
+    On Error Resume Next
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    colHeader = wsDash.Range(keyCellName).Value
+    On Error GoTo 0
+    
+    If wsCache Is Nothing Or colHeader = "" Then GoTo ExitSub
+    
+    Set foundHeader = wsCache.Rows(CACHE_HEAD_ROW).Find(What:=colHeader, LookIn:=xlValues, LookAt:=xlWhole)
+    
+    If Not foundHeader Is Nothing Then
+        Dim TargetCol As Integer
+        ' Map Keys 1-12 to Cache Cols 200-211
+        Dim kNum As Integer
+        kNum = CInt(Replace(Replace(keyCellName, "Key", ""), "_Fetch", ""))
+        TargetCol = 199 + kNum
+        
+        wsCache.Columns(TargetCol).Clear
+        
+        Dim lastRow As Long
+        lastRow = wsCache.Cells(wsCache.Rows.Count, foundHeader.Column).End(xlUp).Row
+        
+        If lastRow > CACHE_HEAD_ROW Then
+            wsCache.Range(wsCache.Cells(CACHE_HEAD_ROW + 1, foundHeader.Column), wsCache.Cells(lastRow, foundHeader.Column)).Copy Destination:=wsCache.Cells(1, TargetCol)
+            wsCache.Columns(TargetCol).RemoveDuplicates Columns:=1, header:=xlNo
+            wsCache.Columns(TargetCol).Sort key1:=wsCache.Cells(1, TargetCol), Order1:=xlAscending, header:=xlNo
+            
+            Dim lastUnique As Long
+            lastUnique = wsCache.Cells(wsCache.Rows.Count, TargetCol).End(xlUp).Row
+            
+            If lastUnique > 0 Then
+                ThisWorkbook.Names.Add Name:="List_" & valCellName, RefersTo:="=Cache!" & wsCache.Range(wsCache.Cells(1, TargetCol), wsCache.Cells(lastUnique, TargetCol)).Address
+                
+                wsDash.Unprotect Password:=ADMIN_PASS
+                Apply_Validation wsDash.Range(valCellName), "=List_" & valCellName
+                wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+            End If
+        End If
+    End If
+ExitSub:
+    Application.ScreenUpdating = True
+End Sub
+
+Sub Apply_Validation(rng As Range, formula As String)
+    On Error Resume Next
+    With rng.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, Formula1:=formula
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ShowError = True
+    End With
+    On Error GoTo 0
+End Sub
+Sub Btn_Fetch_Click()
+    Dim wsDash As Worksheet, wsData As Worksheet, wsCache As Worksheet
+    Dim keyArr(1 To 12) As String, valArr(1 To 12) As String
+    Dim colIdx(1 To 12) As Long
+    Dim lastRow As Long, lastCol As Long, i As Long, k As Long
+    Dim checkChar As String: checkChar = ChrW(&H2714) & " "
+    Dim rawVals As Variant, cleanArr() As String
+    Dim tmpVal As String
+    Dim rKey As Range, rVal As Range
+    Dim visibleRange As Range, area As Range
+    Dim arrRaw As Variant, arrFinal As Variant
+    Dim r As Long, c As Long, rowCounter As Long
+    Dim isDateColumn() As Boolean
+    Dim headerVal As String
+    Dim colLetter As String, validationFormula As String, rngCol As Range
+    Dim dateHeuristicCount As Integer, checkRow As Long, maxCheckRow As Long, cellFmt As String
+    
+    Const CACHE_HEAD_ROW As Long = 2
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    If wsDash.Range("Path_Source").Value = "" Then MsgBox "Please load source.", vbExclamation: GoTo Cleanup
+    On Error Resume Next
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    On Error GoTo 0
+    If wsCache Is Nothing Then MsgBox "Cache empty.", vbExclamation: GoTo Cleanup
+    If wsCache.AutoFilterMode Then wsCache.AutoFilterMode = False
+    
+    ' Fetch Mappings
+    For k = 1 To 12
+        On Error Resume Next
+        Set rKey = wsDash.Range("Key" & k & "_Fetch")
+        Set rVal = wsDash.Range("Val" & k & "_Fetch")
+        On Error GoTo 0
+        If Not rKey Is Nothing And Not rVal Is Nothing Then
+            keyArr(k) = CStr(rKey.Value)
+            valArr(k) = CStr(rVal.Value)
+            colIdx(k) = GetColNum(wsCache, CACHE_HEAD_ROW, keyArr(k))
+        End If
+    Next k
+    
+    ' Smart Column Detection
+    Dim rngEndMarker As Range
+    Set rngEndMarker = wsCache.Rows(CACHE_HEAD_ROW).Find(What:="Source_Sheet_Name", LookIn:=xlValues, LookAt:=xlWhole)
+    If Not rngEndMarker Is Nothing Then
+        lastCol = rngEndMarker.Column
+    Else
+        lastCol = wsCache.Cells(CACHE_HEAD_ROW, Columns.Count).End(xlToLeft).Column
+        If lastCol > 190 Then lastCol = 190
+    End If
+    lastRow = wsCache.Cells(wsCache.Rows.Count, 1).End(xlUp).Row
+    
+    ' Filter Data
+    With wsCache.Range(wsCache.Cells(CACHE_HEAD_ROW, 1), wsCache.Cells(lastRow, lastCol))
+        For k = 1 To 12
+            If keyArr(k) <> "" And valArr(k) <> "" And colIdx(k) > 0 Then
+                rawVals = Split(valArr(k), ", ")
+                ReDim cleanArr(0 To UBound(rawVals))
+                For i = 0 To UBound(rawVals)
+                    tmpVal = Replace(rawVals(i), checkChar, "")
+                    cleanArr(i) = Trim(tmpVal)
+                Next i
+                .AutoFilter Field:=colIdx(k), Criteria1:=cleanArr, Operator:=xlFilterValues
+            End If
+        Next k
+    End With
+    
+    ' Prepare Data View
+    On Error Resume Next
+    ThisWorkbook.Sheets("Data_View").Delete
+    On Error GoTo 0
+    Set wsData = ThisWorkbook.Sheets.Add(After:=wsDash)
+    wsData.Name = "Data_View"
+    wsData.Tab.Color = RGB(144, 238, 144)
+    
+    ' Copy Visible Data
+    On Error Resume Next
+    Set visibleRange = wsCache.Range(wsCache.Cells(CACHE_HEAD_ROW, 1), wsCache.Cells(lastRow, lastCol)).SpecialCells(xlCellTypeVisible)
+    On Error GoTo 0
+    If visibleRange Is Nothing Then MsgBox "No data found.", vbInformation: wsData.Delete: GoTo Cleanup
+    
+    ' Paste Formats & Clean System Cols
+    visibleRange.Copy
+    wsData.Range("A4").PasteSpecial xlPasteFormats
+    Application.CutCopyMode = False
+    
+    ' Detect Date Columns
+    ReDim isDateColumn(1 To lastCol)
+    For c = 1 To lastCol
+        headerVal = UCase(Trim(wsCache.Cells(CACHE_HEAD_ROW, c).Value))
+        If InStr(1, headerVal, "DATE") > 0 Or InStr(1, headerVal, "DOB") > 0 Or _
+           InStr(1, headerVal, "DD-MMM") > 0 Or InStr(1, headerVal, "YYYY") > 0 Then
+            isDateColumn(c) = True
+        Else
+            isDateColumn(c) = False
+            dateHeuristicCount = 0
+            maxCheckRow = wsCache.Cells(wsCache.Rows.Count, c).End(xlUp).Row
+            If maxCheckRow > 15 Then maxCheckRow = 15
+            For checkRow = 3 To maxCheckRow
+                cellFmt = LCase(wsCache.Cells(checkRow, c).NumberFormat)
+                If (InStr(cellFmt, "d") > 0 Or InStr(cellFmt, "m") > 0 Or InStr(cellFmt, "y") > 0) And _
+                   (InStr(cellFmt, "gen") = 0 And InStr(cellFmt, "0.0") = 0) Then
+                    dateHeuristicCount = dateHeuristicCount + 1
+                End If
+            Next checkRow
+            If dateHeuristicCount > 0 Then isDateColumn(c) = True
+        End If
+    Next c
+    
+    ' Process Data Values (Force Text for Dates)
+    Dim totalVisibleRows As Long: totalVisibleRows = 0
+    For Each area In visibleRange.Areas: totalVisibleRows = totalVisibleRows + area.Rows.Count: Next area
+    For c = 1 To lastCol
+        If isDateColumn(c) Then wsData.Range(wsData.Cells(4, c), wsData.Cells(4 + totalVisibleRows, c)).NumberFormat = "@"
+    Next c
+    
+    ReDim arrFinal(1 To totalVisibleRows, 1 To lastCol)
+    rowCounter = 0
+    For Each area In visibleRange.Areas
+        arrRaw = area.Value
+        If IsArray(arrRaw) Then
+            For r = 1 To UBound(arrRaw, 1)
+                rowCounter = rowCounter + 1
+                For c = 1 To lastCol
+                    If isDateColumn(c) And IsNumeric(arrRaw(r, c)) And arrRaw(r, c) > 20000 And arrRaw(r, c) < 80000 Then
+                          arrFinal(rowCounter, c) = Format(arrRaw(r, c), "dd-mmm-yyyy")
+                    ElseIf IsDate(arrRaw(r, c)) Then
+                          arrFinal(rowCounter, c) = Format(arrRaw(r, c), "dd-mmm-yyyy")
+                    Else
+                          arrFinal(rowCounter, c) = arrRaw(r, c)
+                    End If
+                Next c
+            Next r
+        Else
+            rowCounter = rowCounter + 1
+            arrFinal(rowCounter, 1) = arrRaw
+        End If
+    Next area
+    wsData.Range("A4").Resize(totalVisibleRows, lastCol).Value = arrFinal
+    
+    ' Hide Tracking Column
+    Dim rngHeader As Range
+    On Error Resume Next
+    Set rngHeader = wsData.Rows(4).Find(What:="Source_Sheet_Name", LookIn:=xlValues, LookAt:=xlWhole)
+    If Not rngHeader Is Nothing Then wsData.Columns(rngHeader.Column).Hidden = True
+    On Error GoTo 0
+    
+    ' ==============================================================================
+    ' 6. UI SETUP (UPDATED: TRIPLE BUTTON LOGIC)
+    ' ==============================================================================
+    wsData.Range(wsData.Cells(1, lastCol + 1), wsData.Cells(wsData.Rows.Count, Columns.Count)).Clear
+    wsData.UsedRange.WrapText = False
+    wsData.UsedRange.EntireColumn.AutoFit
+    wsData.Rows("1:3").RowHeight = 20
+    
+    Dim btn As Shape
+    
+    ' --- BUTTON 1: BACK BUTTON (Fixed Left) ---
+    Set btn = wsData.Shapes.AddShape(msoShapeRoundedRectangle, 10, 10, 200, 40)
+    With btn
+        .TextFrame.Characters.Text = "< BACK TO DASHBOARD"
+        .Fill.ForeColor.RGB = RGB(0, 191, 255): .OnAction = "Go_To_Dashboard"
+        .TextFrame.Characters.Font.Bold = True
+        .TextFrame.HorizontalAlignment = xlHAlignCenter
+        .TextFrame.VerticalAlignment = xlVAlignCenter
+    End With
+    
+    ' --- BUTTON 2: PRIMARY UPDATE BUTTON (Fixed Original Place) ---
+    Set btn = wsData.Shapes.AddShape(msoShapeRoundedRectangle, 230, 10, 200, 40)
+    With btn
+        .TextFrame.Characters.Text = "UPDATE DATA"
+        .Fill.ForeColor.RGB = RGB(0, 176, 80): .OnAction = "Btn_Update_Click"
+        .TextFrame.Characters.Font.Bold = True
+        .TextFrame.HorizontalAlignment = xlHAlignCenter
+        .TextFrame.VerticalAlignment = xlVAlignCenter
+    End With
+    
+    ' --- DYNAMIC BUTTONS (First and Last Editable Columns) ---
+    Dim firstEditCol As Long, lastEditCol As Long
+    firstEditCol = 0: lastEditCol = 0
+    
+    ' Find indices for the first and last editable columns
+    For i = 1 To lastCol
+        If wsCache.Cells(1, i).Value = "EDITABLE" Then
+            If firstEditCol = 0 Then firstEditCol = i
+            lastEditCol = i
+        End If
+    Next i
+    
+    ' Draw Button on FIRST Editable Column (if not overlapping fixed buttons)
+    If firstEditCol > 0 Then
+        Set rngCol = wsData.Cells(1, firstEditCol)
+        If rngCol.Left > 440 Then
+            Set btn = wsData.Shapes.AddShape(msoShapeRoundedRectangle, rngCol.Left, 10, rngCol.Width, 40)
+            FormatContextButton btn, rngCol.Width
+        End If
+    End If
+    
+    ' Draw Button on LAST Editable Column (if different from first and not overlapping)
+    If lastEditCol > firstEditCol Then
+        Set rngCol = wsData.Cells(1, lastEditCol)
+        If rngCol.Left > 440 Then
+            Set btn = wsData.Shapes.AddShape(msoShapeRoundedRectangle, rngCol.Left, 10, rngCol.Width, 40)
+            FormatContextButton btn, rngCol.Width
+        End If
+    End If
+
+    ' ==============================================================================
+    ' 7. LOCKING & VALIDATION
+    ' ==============================================================================
+    wsData.Activate: wsData.Range("A5").Select: ActiveWindow.FreezePanes = True
+    Call Map_Dropdowns_To_DataView
+    
+    wsData.Cells.Locked = True
+    lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
+    If lastRow > 4 Then
+        For i = 1 To lastCol
+            If wsCache.Cells(1, i).Value = "EDITABLE" Then
+                Set rngCol = wsData.Range(wsData.Cells(5, i), wsData.Cells(lastRow, i))
+                rngCol.Locked = False
+                If isDateColumn(i) Then
+                    colLetter = Split(wsData.Cells(1, i).Address, "$")(1)
+                    validationFormula = "=AND(LEN(" & colLetter & "5)=11, MID(" & colLetter & "5,3,1)=""-"", MID(" & colLetter & "5,7,1)=""-"")"
+                    With rngCol.Validation
+                        .Delete
+                        .Add Type:=xlValidateCustom, AlertStyle:=xlValidAlertStop, Formula1:=validationFormula
+                        .ShowError = True
+                    End With
+                End If
+            End If
+        Next i
+    End If
+    
+    If Not wsData.AutoFilterMode Then wsData.Range("A4").AutoFilter
+    wsData.Protect Password:="", DrawingObjects:=False, Contents:=True, Scenarios:=True, AllowFormattingCells:=True, AllowFiltering:=True
+    If wsCache.AutoFilterMode Then wsCache.ShowAllData
+    
+Cleanup:
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+End Sub
+
+' Helper to standardize the contextual button look
+Private Sub FormatContextButton(shp As Shape, w As Double)
+    With shp
+        .TextFrame.Characters.Text = "UPDATE DATA"
+        .Fill.ForeColor.RGB = RGB(0, 176, 80)
+        .OnAction = "Btn_Update_Click"
+        .TextFrame.Characters.Font.Bold = True
+        .TextFrame.HorizontalAlignment = xlHAlignCenter
+        .TextFrame.VerticalAlignment = xlVAlignCenter
+        If w < 80 Then .TextFrame.Characters.Font.Size = 8
+    End With
+End Sub
+
+Sub Btn_Update_Click()
+    Dim wsDash As Worksheet, wsData As Worksheet
+    Dim wbTarget As Workbook, wsTarget As Worksheet
+    Dim pathTarget As String, fileName As String
+    Dim wasAlreadyOpen As Boolean
+    Dim fso As Object ' <--- FSO Declaration
+    
+    Dim dictTarget As Object
+    Dim hRowSrc As Long, hRowTarget As Long, destHeaderRow As Long
+    Dim lastRowData As Long, lastRowTarget As Long
+    Dim i As Long, r As Long, k As Long
+    Dim keyStr As String, countUpdated As Long
+    
+    Dim colSheetName As Long
+    Dim currentSheetName As String
+    Dim uniqueSheets As Collection, vSheet As Variant
+    
+    Dim arrMatchKeyNames(1 To 12) As String
+    Dim arrMatchKeyColsTarget(1 To 12) As Long
+    Dim arrMatchKeyColsSrc(1 To 12) As Long
+    Dim arrUpdateFields(1 To 12) As String
+    Dim arrUpdateColsTarget(1 To 12) As Long
+    Dim arrUpdateColsSrc(1 To 12) As Long
+    
+    Dim valNew As Variant, valOld As Variant
+    Dim logOld As String, logNew As String
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    Set transactionLogs = New Collection
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    On Error Resume Next
+    Set wsData = ThisWorkbook.Sheets("Data_View")
+    On Error GoTo 0
+    If wsData Is Nothing Then MsgBox "Data not fetched.", vbExclamation: GoTo Cleanup
+
+    hRowSrc = wsDash.Range("Header_Row").Value: If hRowSrc < 1 Then hRowSrc = 12
+    destHeaderRow = 4
+    lastRowData = wsData.Cells(wsData.Rows.Count, 1).End(xlUp).Row
+    If lastRowData <= destHeaderRow Then MsgBox "No rows to update.", vbExclamation: GoTo Cleanup
+
+    pathTarget = wsDash.Range("Path_Source").Value
+    
+    ' <--- REFACTORED: Use FSO instead of Dir() for Unicode support
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not fso.FileExists(pathTarget) Then
+        MsgBox "Invalid source file path.", vbCritical
+        Set fso = Nothing
+        GoTo Cleanup
+    End If
+    
+    fileName = fso.GetFileName(pathTarget)
+    Set fso = Nothing
+    ' <--- END REFACTOR
+
+    ' Find Tracking Column (Sheet Name Only)
+    colSheetName = GetColNum(wsData, destHeaderRow, "Source_Sheet_Name")
+    If colSheetName = 0 Then MsgBox "Error: Source_Sheet_Name missing.", vbCritical: GoTo Cleanup
+
+    ' Load Mappings
+    For i = 1 To 12
+        On Error Resume Next
+        arrMatchKeyNames(i) = CStr(wsDash.Range("Key" & i & "_Update").Value)
+        arrUpdateFields(i) = CStr(wsDash.Range("Col" & i & "_Update").Value)
+        On Error GoTo 0
+    Next i
+
+    ' Identify Sheets
+    Set uniqueSheets = New Collection
+    On Error Resume Next
+    For r = destHeaderRow + 1 To lastRowData
+        If Not wsData.Rows(r).Hidden Then
+            currentSheetName = Trim(CStr(wsData.Cells(r, colSheetName).Value))
+            If currentSheetName <> "" Then uniqueSheets.Add currentSheetName, currentSheetName
+        End If
+    Next r
+    On Error GoTo 0
+    If uniqueSheets.Count = 0 Then MsgBox "No sheets identified.", vbExclamation: GoTo Cleanup
+
+    ' Open File
+    Application.DisplayAlerts = False
+    Set wbTarget = Robust_Open_Workbook_With_Retry(pathTarget, True, wasAlreadyOpen)
+    If wbTarget Is Nothing Then MsgBox "File locked.", vbCritical: GoTo Cleanup
+    Application.DisplayAlerts = True
+    
+    hRowTarget = hRowSrc
+    countUpdated = 0
+
+    ' Loop Sheets
+    For Each vSheet In uniqueSheets
+        currentSheetName = CStr(vSheet)
+        On Error Resume Next
+        Set wsTarget = wbTarget.Sheets(currentSheetName)
+        On Error GoTo 0
+        
+        If Not wsTarget Is Nothing Then
+            Dim validMapping As Boolean: validMapping = True
+            
+            ' Calc Column Indices
+            For i = 1 To 12
+                If arrMatchKeyNames(i) <> "" Then
+                    arrMatchKeyColsTarget(i) = GetColNum(wsTarget, hRowTarget, arrMatchKeyNames(i))
+                    arrMatchKeyColsSrc(i) = GetColNum(wsData, destHeaderRow, arrMatchKeyNames(i))
+                    If arrMatchKeyColsTarget(i) = 0 Or arrMatchKeyColsSrc(i) = 0 Then validMapping = False
+                End If
+                If arrUpdateFields(i) <> "" Then
+                    arrUpdateColsTarget(i) = GetColNum(wsTarget, hRowTarget, arrUpdateFields(i))
+                    arrUpdateColsSrc(i) = GetColNum(wsData, destHeaderRow, arrUpdateFields(i))
+                    If arrUpdateColsTarget(i) = 0 Or arrUpdateColsSrc(i) = 0 Then validMapping = False
+                End If
+            Next i
+            
+            If validMapping Then
+                Set dictTarget = CreateObject("Scripting.Dictionary")
+                lastRowTarget = wsTarget.Cells(wsTarget.Rows.Count, 1).End(xlUp).Row
+                Dim tArr As Variant, maxColUsed As Long
+                
+                maxColUsed = UsedRangeLastCol(wsTarget)
+                If maxColUsed < 100 Then maxColUsed = 100
+                
+                ' -------------------------------------------------------------
+                ' BUILD DICTIONARY: KEY = [KEY1] | [KEY2]... |
+                ' -------------------------------------------------------------
+                If lastRowTarget > hRowTarget Then
+                    tArr = wsTarget.Range(wsTarget.Cells(hRowTarget + 1, 1), wsTarget.Cells(lastRowTarget, maxColUsed)).Value
+                    For r = 1 To UBound(tArr, 1)
+                        keyStr = "|"
+                        For i = 1 To 12
+                            If arrMatchKeyNames(i) <> "" Then
+                                If arrMatchKeyColsTarget(i) <= UBound(tArr, 2) Then
+                                    keyStr = keyStr & CleanKey(tArr(r, arrMatchKeyColsTarget(i))) & "|"
+                                End If
+                            End If
+                        Next i
+                        If Not dictTarget.Exists(keyStr) Then dictTarget.Add keyStr, r + hRowTarget
+                    Next r
+                End If
+                
+                ' -------------------------------------------------------------
+                ' MATCH FROM DATA VIEW
+                ' -------------------------------------------------------------
+                For r = destHeaderRow + 1 To lastRowData
+                    If Trim(CStr(wsData.Cells(r, colSheetName).Value)) = currentSheetName Then
+                        If Not wsData.Rows(r).Hidden Then
+                            ' Create same key structure from Source Data
+                            keyStr = "|"
+                            For i = 1 To 12
+                                If arrMatchKeyNames(i) <> "" Then
+                                    keyStr = keyStr & CleanKey(wsData.Cells(r, arrMatchKeyColsSrc(i)).Value) & "|"
+                                End If
+                            Next i
+
+                            If dictTarget.Exists(keyStr) Then
+                                Dim targetRowNum As Long
+                                targetRowNum = dictTarget(keyStr)
+                                
+                                ' Update Columns
+                                For k = 1 To 12
+                                    If arrUpdateFields(k) <> "" Then
+                                        valNew = wsData.Cells(r, arrUpdateColsSrc(k)).Value
+                                        valOld = wsTarget.Cells(targetRowNum, arrUpdateColsTarget(k)).Value
+                                        
+                                        If Is_Real_Change(valNew, valOld) Then
+                                            If IsDate(valOld) Or (IsNumeric(valOld) And valOld > 20000) Then
+                                                logOld = Format(valOld, "dd-mmm-yyyy")
+                                            Else
+                                                logOld = CStr(valOld)
+                                            End If
+                                            logNew = CStr(valNew)
+                                            
+                                            Call Record_Transaction(fileName, "Update (" & currentSheetName & ")", keyStr, r, arrUpdateColsSrc(k), logOld, logNew, "UPDATED")
+                                            
+                                            If IsDate(valNew) Then
+                                                wsTarget.Cells(targetRowNum, arrUpdateColsTarget(k)).NumberFormat = "@"
+                                                wsTarget.Cells(targetRowNum, arrUpdateColsTarget(k)).Value = CStr(valNew)
+                                            Else
+                                                wsTarget.Cells(targetRowNum, arrUpdateColsTarget(k)).Value = valNew
+                                            End If
+                                            countUpdated = countUpdated + 1
+                                        End If
+                                    End If
+                                Next k
+                            End If
+                        End If
+                    End If
+                Next r
+                Set dictTarget = Nothing
+            End If
+        End If
+    Next vSheet
+
+    If wasAlreadyOpen Then
+        wbTarget.Save
+        MsgBox "Update merged. Cells updated: " & countUpdated, vbInformation
+    Else
+        wbTarget.Close SaveChanges:=True
+        MsgBox "Update Saved. Cells updated: " & countUpdated, vbInformation
+    End If
+    
+    Call Refresh_Cache_Silent_Internal
+    Call Write_Internal_Log_Internal
+
+Cleanup:
+    Set dictTarget = Nothing
+    Set transactionLogs = Nothing
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
+' ==========================================
+' 8. CORE HELPER FUNCTIONS (PASTE AT BOTTOM)
+' ==========================================
+
+Function CleanKey(val As Variant) As String
+    Dim s As String
+    ' 1. Handle Errors/Nulls
+    If IsError(val) Then CleanKey = "ERR": Exit Function
+    If IsNull(val) Then CleanKey = "": Exit Function
+    If IsEmpty(val) Then CleanKey = "": Exit Function
+    
+    ' 2. SERIAL DATE FIX (The "43657" Case)
+    If IsNumeric(val) Then
+        If val > 20000 And val < 80000 Then
+            CleanKey = UCase(Format(val, "dd-mmm-yyyy"))
+            Exit Function
+        End If
+    End If
+    
+    ' 3. Standard Date Fix
+    If IsDate(val) Then
+        CleanKey = UCase(Format(val, "dd-mmm-yyyy"))
+        Exit Function
+    End If
+    
+    ' 4. Standard String Cleaning
+    s = CStr(val)
+    s = Trim(s)
+    s = Replace(s, Chr(160), "") ' Remove non-breaking spaces
+    s = UCase(s)
+    
+    CleanKey = s
+End Function
+
+Function Is_Real_Change(valView As Variant, valSource As Variant) As Boolean
+    Dim sView As String
+    Dim sSource As String
+    Dim viewIsDate As Boolean
+    
+    ' 1. Convert to String & Handle Errors
+    If IsError(valView) Then valView = ""
+    If IsError(valSource) Then valSource = ""
+    sView = CStr(valView)
+    sSource = CStr(valSource)
+    
+    ' 2. AGGRESSIVE CLEANING (Fixes the "Ghost Update" Loop)
+    ' Removes Line Breaks (Alt+Enter), Tabs, and NBSP
+    sView = CleanString(sView)
+    sSource = CleanString(sSource)
+    
+    ' 3. Fast Exit if Identical
+    If StrComp(sView, sSource, vbTextCompare) = 0 Then
+        Is_Real_Change = False
+        Exit Function
+    End If
+    
+    ' 4. Handle Empty Artifacts
+    If sView = "0" And sSource = "" Then Exit Function
+    If sView = "" And sSource = "0" Then Exit Function
+    
+    ' 5. CONTEXT AWARE DATE CHECK
+    ' Only compare as dates if the User's View looks like a date
+    viewIsDate = IsDate(sView)
+    
+    If viewIsDate Then
+        ' Normalize View Date
+        sView = Format(CDate(sView), "dd-mmm-yyyy")
+        
+        ' Normalize Source Date (Handle Serial Numbers or Strings)
+        If IsNumeric(sSource) And val(sSource) > 20000 And val(sSource) < 80000 Then
+            sSource = Format(val(sSource), "dd-mmm-yyyy")
+        ElseIf IsDate(sSource) Then
+            sSource = Format(CDate(sSource), "dd-mmm-yyyy")
+        End If
+    End If
+    
+    ' 6. Final Comparison
+    If StrComp(sView, sSource, vbTextCompare) <> 0 Then
+        Is_Real_Change = True
+    Else
+        Is_Real_Change = False
+    End If
+End Function
+
+' Helper to strip invisible characters that cause false updates
+Function CleanString(txt As String) As String
+    Dim tmp As String
+    tmp = txt
+    tmp = Replace(tmp, Chr(10), "")  ' Line Feed
+    tmp = Replace(tmp, Chr(13), "")  ' Carriage Return
+    tmp = Replace(tmp, Chr(9), "")   ' Tab
+    tmp = Replace(tmp, Chr(160), "") ' Non-breaking space
+    tmp = Application.WorksheetFunction.Clean(tmp) ' Excel Clean
+    tmp = Trim(tmp)
+    CleanString = tmp
+End Function
+
+Function GetColNum(ws As Worksheet, r As Long, header As String) As Long
+    Dim f As Range
+    Set f = ws.Rows(r).Find(header, LookAt:=xlWhole)
+    If Not f Is Nothing Then GetColNum = f.Column
+End Function
+
+Function UsedRangeLastCol(ws As Worksheet) As Long
+    On Error Resume Next
+    UsedRangeLastCol = ws.Cells.Find("*", SearchOrder:=xlByColumns, SearchDirection:=xlPrevious).Column
+    If UsedRangeLastCol = 0 Then UsedRangeLastCol = 1
+End Function
+
+Function Robust_Open_Workbook_With_Retry(path As String, requireWriteAccess As Boolean, ByRef wasAlreadyOpen As Boolean) As Workbook
+    Dim wb As Workbook
+    Dim attempt As Integer
+    Set Robust_Open_Workbook_With_Retry = Nothing
+    
+    ' Check if already open
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, path, vbTextCompare) = 0 Then
+            Set Robust_Open_Workbook_With_Retry = wb
+            If requireWriteAccess And wb.ReadOnly Then
+                 wb.Close False
+                 wasAlreadyOpen = False
+                 Exit For
+            End If
+            wasAlreadyOpen = True
+            Exit Function
+        End If
+    Next wb
+    
+    ' Retry Loop
+    For attempt = 1 To 3
+        On Error Resume Next
+        Set wb = Workbooks.Open(fileName:=path, UpdateLinks:=False, ReadOnly:=Not requireWriteAccess, Notify:=False)
+        On Error GoTo 0
+        If Not wb Is Nothing Then
+            If requireWriteAccess And wb.ReadOnly Then
+                wb.Close False
+                Set wb = Nothing
+            Else
+                Set Robust_Open_Workbook_With_Retry = wb
+                wasAlreadyOpen = False
+                Exit Function
+            End If
+        End If
+        If attempt < 3 Then Application.Wait (Now + TimeValue("00:00:02"))
+    Next attempt
+End Function
+Sub Record_Transaction(targetFileName As String, op As String, keyString As String, rIdx As Long, cIdx As Long, oVal As String, nVal As String, stat As String)
+    Dim logEntry As Variant
+    Dim colLetter As String
+    On Error Resume Next
+    colLetter = Split(Cells(1, cIdx).Address, "$")(1)
+    logEntry = Array(Now(), Environ("Username"), targetFileName, op, keyString, rIdx, colLetter, oVal, nVal, stat)
+    If transactionLogs Is Nothing Then Set transactionLogs = New Collection
+    transactionLogs.Add logEntry
+End Sub
+
+Sub Write_Internal_Log_Internal()
+    Dim wsLog As Worksheet, nextRow As Long, i As Long, j As Long
+    Dim transData As Variant, headers As Variant
+    On Error Resume Next
+    Set wsLog = ThisWorkbook.Sheets("Audit_Logs")
+    On Error GoTo 0
+    If wsLog Is Nothing Then
+        Set wsLog = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsLog.Name = "Audit_Logs"
+        headers = Array("Timestamp", "User", "File Name", "Operation", "Details (Key)", "Row Index", "Column Index", "Old Value", "New Value", "Status")
+        wsLog.Range("A1").Resize(1, 10).Value = headers
+        wsLog.Range("A1:J1").Font.Bold = True
+    End If
+    If Not transactionLogs Is Nothing Then
+        If transactionLogs.Count > 0 Then
+            nextRow = wsLog.Cells(wsLog.Rows.Count, "A").End(xlUp).Row + 1
+            ReDim transData(1 To transactionLogs.Count, 1 To 10)
+            For i = 1 To transactionLogs.Count
+                For j = 0 To 9
+                    transData(i, j + 1) = transactionLogs(i)(j)
+                Next j
+            Next i
+            wsLog.Range("A" & nextRow).Resize(UBound(transData, 1), 10).Value = transData
+            wsLog.Columns("A:J").AutoFit
+        End If
+    End If
+End Sub
+
+Sub Btn_Clear_Click()
+    Dim wsDash As Worksheet, wsCache As Worksheet
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    
+    On Error Resume Next
+    wsDash.Unprotect Password:=ADMIN_PASS
+    
+    ' Wipe Fetch VALUES Only (Keys Preserved)
+    Dim i As Integer
+    For i = 1 To 12
+        wsDash.Range("Val" & i & "_Fetch").MergeArea.ClearContents
+    Next i
+    
+    wsDash.Range("Path_Source").MergeArea.ClearContents
+    wsDash.Range("Sheet_Source").MergeArea.ClearContents
+    
+    ThisWorkbook.Sheets("Data_View").Delete
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    If Not wsCache Is Nothing Then wsCache.Cells.Clear
+    
+    ThisWorkbook.Names("List_Headers").Delete
+    ThisWorkbook.Names("List_Editable").Delete
+    ThisWorkbook.Names("DynamicSheetList").Delete
+    On Error GoTo 0
+    
+    wsDash.Protect Password:=ADMIN_PASS, DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+    
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    
+    MsgBox "Clear Complete." & vbNewLine & _
+            "- Fetch Values: Cleared" & vbNewLine & _
+            "- Fetch Keys: Preserved" & vbNewLine & _
+            "- Update Columns: Preserved", vbInformation
+End Sub
+
+Sub Refresh_Cache_Silent_Internal()
+    Dim filePath As String, sheetName As String
+    Dim wsCache As Worksheet
+    Dim wsDash As Worksheet
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    On Error Resume Next
+    filePath = wsDash.Range("Path_Source").Value
+    sheetName = wsDash.Range("Sheet_Source").Value
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    On Error GoTo 0
+    If filePath = "" Or wsCache Is Nothing Then Exit Sub
+    If sheetName = "" Then sheetName = "Sheet1"
+    Call Load_New_Sheet_Selection
+End Sub
+
+Sub Map_Dropdowns_To_DataView()
+    Dim wsData As Worksheet, wsRef As Worksheet
+    Dim lastColData As Long, lastColRef As Long
+    Dim rRef As Long
+    Dim i As Long, j As Long
+    Dim headerData As String, headerRef As String
+    Dim refRangeAddr As String
+    Dim rngTarget As Range
+    
+    On Error Resume Next
+    Set wsData = ThisWorkbook.Sheets("Data_View")
+    Set wsRef = ThisWorkbook.Sheets("Dropdowns")
+    On Error GoTo 0
+    
+    If wsData Is Nothing Then Exit Sub
+    If wsRef Is Nothing Then Exit Sub
+    
+    lastColData = wsData.Cells(4, Columns.Count).End(xlToLeft).Column
+    lastColRef = wsRef.Cells(1, Columns.Count).End(xlToLeft).Column
+    
+    For i = 1 To lastColData
+        headerData = Trim(UCase(wsData.Cells(4, i).Value))
+        For j = 1 To lastColRef
+            headerRef = Trim(UCase(wsRef.Cells(1, j).Value))
+            If headerData = headerRef And headerData <> "" Then
+                rRef = wsRef.Cells(wsRef.Rows.Count, j).End(xlUp).Row
+                If rRef > 1 Then
+                    refRangeAddr = "'Dropdowns'!" & wsRef.Range(wsRef.Cells(2, j), wsRef.Cells(rRef, j)).Address
+                    Dim lastRowData As Long
+                    lastRowData = wsData.Cells(wsData.Rows.Count, 1).End(xlUp).Row
+                    If lastRowData >= 5 Then
+                        Set rngTarget = wsData.Range(wsData.Cells(5, i), wsData.Cells(lastRowData, i))
+                        With rngTarget.Validation
+                            .Delete
+                            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, Formula1:="=" & refRangeAddr
+                            .IgnoreBlank = True
+                            .InCellDropdown = True
+                            .ShowError = True
+                        End With
+                    End If
+                End If
+                Exit For
+            End If
+        Next j
+    Next i
+End Sub
+
+' HELPER: CLEAN DROPDOWN TICKS
+Sub Clear_Dropdown_Ticks(valCellName As String)
+    Dim wsCache As Worksheet: Set wsCache = ThisWorkbook.Sheets("Cache")
+    Dim TargetCol As Integer
+    Dim checkChar As String: checkChar = ChrW(&H2714) & " "
+    Dim i As Long, lastUnique As Long
+    
+    ' Extract number from string like "Val3_Fetch"
+    Dim kNum As Integer
+    kNum = CInt(Replace(Replace(valCellName, "Val", ""), "_Fetch", ""))
+    TargetCol = 199 + kNum ' Val1=200, Val12=211
+    
+    If TargetCol < 200 Or TargetCol > 211 Then Exit Sub
+    
+    Application.ScreenUpdating = False
+    lastUnique = wsCache.Cells(wsCache.Rows.Count, TargetCol).End(xlUp).Row
+    
+    For i = 1 To lastUnique
+        Dim itemVal As String: itemVal = wsCache.Cells(i, TargetCol).Value
+        If InStr(1, itemVal, checkChar) > 0 Then
+            wsCache.Cells(i, TargetCol).Value = Replace(itemVal, checkChar, "")
+        End If
+    Next i
+    Application.ScreenUpdating = True
+End Sub
+
+Sub Refresh_Ticked_List(valCellName As String, currentCellString As String)
+    Dim wsCache As Worksheet: Set wsCache = ThisWorkbook.Sheets("Cache")
+    Dim TargetCol As Integer
+    Dim checkChar As String: checkChar = ChrW(&H2714) & " "
+    Dim i As Long, lastUnique As Long, j As Long
+    Dim itemVal As String
+    Dim selectedArr() As String
+    Dim isSelected As Boolean
+    
+    Dim kNum As Integer
+    kNum = CInt(Replace(Replace(valCellName, "Val", ""), "_Fetch", ""))
+    TargetCol = 199 + kNum
+    
+    selectedArr = Split(currentCellString, ", ")
+    For j = LBound(selectedArr) To UBound(selectedArr)
+        selectedArr(j) = Replace(selectedArr(j), checkChar, "")
+    Next j
+    
+    lastUnique = wsCache.Cells(wsCache.Rows.Count, TargetCol).End(xlUp).Row
+    
+    For i = 1 To lastUnique
+        itemVal = wsCache.Cells(i, TargetCol).Value
+        itemVal = Replace(itemVal, checkChar, "")
+        isSelected = False
+        For j = LBound(selectedArr) To UBound(selectedArr)
+            If StrComp(Trim(selectedArr(j)), Trim(itemVal), vbTextCompare) = 0 Then
+                isSelected = True
+                Exit For
+            End If
+        Next j
+        
+        If isSelected Then
+            wsCache.Cells(i, TargetCol).Value = checkChar & itemVal
+        Else
+            wsCache.Cells(i, TargetCol).Value = itemVal
+        End If
+    Next i
+End Sub
+
+
+' ==========================================
+' NEW VALIDATION LOGIC (AUDIT ONLY - NO DELETE)
+' ==========================================
+Sub Check_Mapping_Integrity()
+    Dim wsDash As Worksheet, wsCache As Worksheet
+    Dim lastCol As Long, c As Long
+    Dim validHeaders As Object
+    Dim rngCheck As Range
+    Dim mismatchList As String
+    Dim headerVal As String
+    
+    Set wsDash = ThisWorkbook.Sheets("Dashboard")
+    Set wsCache = ThisWorkbook.Sheets("Cache")
+    Set validHeaders = CreateObject("Scripting.Dictionary")
+    
+    ' 1. Load Valid Headers from Cache into Dictionary
+    '    (We use UCase to ensure case-insensitive matching)
+    lastCol = wsCache.Cells(2, Columns.Count).End(xlToLeft).Column
+    
+    For c = 1 To lastCol
+        headerVal = Trim(UCase(wsCache.Cells(2, c).Value))
+        If headerVal <> "" Then
+            validHeaders(headerVal) = 1
+        End If
+    Next c
+    
+    ' 2. Check Match Keys (Key1_Update to Key12_Update)
+    For c = 1 To 12
+        On Error Resume Next
+        Set rngCheck = wsDash.Range("Key" & c & "_Update")
+        If Not rngCheck Is Nothing Then
+            If Trim(rngCheck.Value) <> "" Then
+                If Not validHeaders.Exists(Trim(UCase(rngCheck.Value))) Then
+                    mismatchList = mismatchList & "Match Key " & c & ": " & rngCheck.Value & vbNewLine
+                End If
+            End If
+        End If
+        On Error GoTo 0
+    Next c
+    
+    ' 3. Check Update Columns (Col1_Update to Col12_Update)
+    For c = 1 To 12
+        On Error Resume Next
+        Set rngCheck = wsDash.Range("Col" & c & "_Update")
+        If Not rngCheck Is Nothing Then
+            If Trim(rngCheck.Value) <> "" Then
+                If Not validHeaders.Exists(Trim(UCase(rngCheck.Value))) Then
+                    mismatchList = mismatchList & "Update Col " & c & ": " & rngCheck.Value & vbNewLine
+                End If
+            End If
+        End If
+        On Error GoTo 0
+    Next c
+    
+    ' 4. Alert User ONLY if Mismatches Found
+    If mismatchList <> "" Then
+        MsgBox "POTENTIAL FILE MISMATCH DETECTED!" & vbNewLine & vbNewLine & _
+               "The following Match/Update fields do not exist in the loaded file:" & vbNewLine & _
+               "------------------------------------------------" & vbNewLine & _
+               mismatchList & _
+               "------------------------------------------------" & vbNewLine & _
+               "Please verify you have selected the correct file or sheet.", vbExclamation
+    End If
+    
+    Set validHeaders = Nothing
+End Sub
+
