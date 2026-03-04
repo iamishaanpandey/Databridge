@@ -2,10 +2,9 @@
 
 **Version:** 2.6
 **Author:** Ishaan Pandey
-**Organization:** STMicroelectronics  
 
 ## Overview
-ST DataBridge is an intelligent, event-driven Excel VBA solution designed to safely bridge the gap between complex source datasets and user-friendly editing. It allows users to query external workbooks, filter data using up to 12 criteria, edit specific columns in a safe cache environment, and push updates back to the source file using a high-speed Scripting Dictionary hash map—all without manually opening or corrupting the master files.
+DataBridge is an intelligent, event-driven Excel VBA solution designed to safely bridge the gap between complex source datasets and user-friendly editing. It allows users to query external workbooks, filter data using up to 12 criteria, edit specific columns in a safe cache environment, and push updates back to the source file using a high-speed Scripting Dictionary hash map—all without manually opening or corrupting the master files.
 
 ## Repository Structure
 This repository contains the raw, uncompiled VBA source code for the tool. The code is divided into three class/basic files:
